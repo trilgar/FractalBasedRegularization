@@ -1,5 +1,7 @@
 import os
 
+import pandas as pd
+import torch
 from PIL import Image
 from torch.utils.data import Dataset
 import h5py
@@ -69,3 +71,35 @@ class HDF5ISICDataset(Dataset):
             image = self.transform(image)
 
         return image
+
+class HAM10000Dataset(Dataset):
+    def __init__(self, df: pd.DataFrame, transform=None, root="F:/datasets/SkinCancer/images"):
+        self.df = df.reset_index(drop=True)
+        self.transform = transform
+        self.root = root
+
+    def __len__(self): return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.root, row["image"])
+        X = Image.open(img_path).convert("RGB")
+        y = int(row["label_idx"])
+        if self.transform is not None:
+            X = self.transform(X)
+        return X, torch.tensor(y, dtype=torch.long)
+
+class SemiSupervisedDataset(Dataset):
+    """Повертає трійку: (labeled_x, labeled_y, unlabeled_x)"""
+    def __init__(self, labeled_ds: Dataset, unlabeled_ds: Dataset):
+        self.labeled_ds = labeled_ds
+        self.unlabeled_ds = unlabeled_ds
+        self.labeled_size = len(labeled_ds)
+        self.unlabeled_size = len(unlabeled_ds)
+
+    def __len__(self): return self.unlabeled_size
+
+    def __getitem__(self, idx):
+        lx, ly = self.labeled_ds[idx % self.labeled_size]
+        ux, _  = self.unlabeled_ds[idx]
+        return lx, ly, ux
