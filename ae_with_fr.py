@@ -1,15 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os, warnings
+import os
+import warnings
 
 from datasets import HAM10000Dataset, SemiSupervisedDataset
 
 warnings.filterwarnings("ignore")
 
-import numpy as np
 import pandas as pd
-from PIL import Image
 import matplotlib.pyplot as plt
 from fd_functions import *
 
@@ -17,7 +16,7 @@ from fd_functions import *
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import DataLoader, random_split
 
 try:
     from lightning import LightningModule, LightningDataModule, Trainer, seed_everything
@@ -39,21 +38,21 @@ DATA_PATH = "F:/datasets/SkinCancer"
 IM_DIR = os.path.join(DATA_PATH, "images")
 CSV_PATH = os.path.join(DATA_PATH, "GroundTruth.csv")
 
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 IMG_SIZE = (96, 96)
 NUM_CLASSES = 2
 NUM_EPOCHS = 10
 LR = 1e-3
-RC_RATE = 0.3              # вага проміжних MSE (out<->dout) усередині reconstruction_loss
 LABELED_FRACTION = 0.05
-MODEL_PATH = "ae_fr_005.pt"
+MODEL_PATH = "fractal_reg_ae_005_fd5.pt"
 
 # Лише одна вага для FD (λ). Реконструкцію не масштабуємо додатково — як у базі.
-LAMBDA_FD = 0.5
+LAMBDA_FD = 2
+RC_RATE = 0.3  # вага проміжних MSE (out<->dout) усередині reconstruction_loss
 
 # нормалізація з базової моделі
 norm_mean = [0.76303685, 0.54564613, 0.570045]
-norm_std  = [0.14092818, 0.15261282, 0.16997021]
+norm_std = [0.14092818, 0.15261282, 0.16997021]
 
 os.makedirs("models", exist_ok=True)
 os.makedirs("plots", exist_ok=True)
@@ -80,6 +79,7 @@ eval_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(norm_mean, norm_std),
 ])
+
 
 # =======================
 # DataModule
@@ -131,8 +131,8 @@ class HAMDataModule(LightningDataModule):
         train_df = pd.concat(samples, axis=0).reset_index(drop=True)
 
         self.train_full = HAM10000Dataset(train_df, transform=train_transform, root=IM_DIR)
-        self.val_set    = HAM10000Dataset(val_df,   transform=eval_transform, root=IM_DIR)
-        self.test_set   = HAM10000Dataset(test_df,  transform=eval_transform, root=IM_DIR)
+        self.val_set = HAM10000Dataset(val_df, transform=eval_transform, root=IM_DIR)
+        self.test_set = HAM10000Dataset(test_df, transform=eval_transform, root=IM_DIR)
 
         n_labeled = int(LABELED_FRACTION * len(self.train_full))
         n_unlabeled = len(self.train_full) - n_labeled
@@ -144,15 +144,16 @@ class HAMDataModule(LightningDataModule):
 
     def train_dataloader(self):
         return DataLoader(self.semi_train, batch_size=self.batch_size, shuffle=True,
-                          pin_memory=True, num_workers=8, persistent_workers=True)
+                          pin_memory=True, num_workers=4, persistent_workers=True)
 
     def val_dataloader(self):
         return DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False,
-                          pin_memory=True, num_workers=8, persistent_workers=True)
+                          pin_memory=True, num_workers=4, persistent_workers=True)
 
     def test_dataloader(self):
         return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False,
-                          pin_memory=True, num_workers=8, persistent_workers=True)
+                          pin_memory=True, num_workers=4, persistent_workers=True)
+
 
 @torch.no_grad()
 def batch_fd_targets_from_images(x: torch.Tensor) -> torch.Tensor:
@@ -161,9 +162,9 @@ def batch_fd_targets_from_images(x: torch.Tensor) -> torch.Tensor:
     Очікує x нормалізований як у train (mean/std). Повертає FD на тому ж пристрої.
     """
     device = x.device
-    mean = torch.tensor(norm_mean, device=device).view(1,3,1,1)
-    std  = torch.tensor(norm_std,  device=device).view(1,3,1,1)
-    x01 = (x*std + mean).clamp(0,1)
+    mean = torch.tensor(norm_mean, device=device).view(1, 3, 1, 1)
+    std = torch.tensor(norm_std, device=device).view(1, 3, 1, 1)
+    x01 = (x * std + mean).clamp(0, 1)
 
     fds = []
     for b in range(x01.size(0)):
@@ -173,12 +174,12 @@ def batch_fd_targets_from_images(x: torch.Tensor) -> torch.Tensor:
         else:
             # резервний спрощений підрахунок (на випадок, якщо модуль відсутній)
             # бінаризація за середнім і box-counting через max-pool
-            g = 0.2989*img[0] + 0.5870*img[1] + 0.1140*img[2]
+            g = 0.2989 * img[0] + 0.5870 * img[1] + 0.1140 * img[2]
             thr = g.mean().item()
             binimg = (g > thr).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
             H, W = g.shape
-            max_pow = int(np.floor(np.log2(min(H,W))))
-            sizes = [2**k for k in range(1, max_pow+1)]
+            max_pow = int(np.floor(np.log2(min(H, W))))
+            sizes = [2 ** k for k in range(1, max_pow + 1)]
             if len(sizes) < 2:
                 fd = 2.0
             else:
@@ -188,13 +189,14 @@ def batch_fd_targets_from_images(x: torch.Tensor) -> torch.Tensor:
                     N = (pooled > 0).sum().item() + 1e-6
                     Ns.append(N)
                 logN = np.log(np.array(Ns))
-                logr = np.log(np.array([1.0/s for s in sizes]))
+                logr = np.log(np.array([1.0 / s for s in sizes]))
                 # лінійна регресія
                 A = np.vstack([logr, np.ones_like(logr)]).T
                 slope = np.linalg.lstsq(A, logN, rcond=None)[0][0]
                 fd = float(slope)
         fds.append(fd)
     return torch.tensor(fds, device=device, dtype=torch.float32)
+
 
 class FDRegressor(nn.Module):
     def __init__(self, latent_channels=256, p_drop=0.1):
@@ -210,6 +212,7 @@ class FDRegressor(nn.Module):
 
     def forward(self, latent):  # latent: [B, C, H, W]
         return self.model(latent).squeeze(1)
+
 
 # =======================
 # Model (AE + FD head)
@@ -247,16 +250,22 @@ class AutoencoderNet(nn.Module):
         self.fd_head = FDRegressor(latent_channels=256)
 
     def encode(self, x):
-        h = F.relu(self.bn1(self.conv1(x))); out1 = h.detach()
-        h = F.relu(self.bn2(self.conv2(h))); out2 = h.detach()
-        h = F.relu(self.bn3(self.conv3(h))); out3 = h.detach()
+        h = F.relu(self.bn1(self.conv1(x)));
+        out1 = h.detach()
+        h = F.relu(self.bn2(self.conv2(h)));
+        out2 = h.detach()
+        h = F.relu(self.bn3(self.conv3(h)));
+        out3 = h.detach()
         z = F.relu(self.bn4(self.conv4(h)))
         return z, (out1, out2, out3)
 
     def decode(self, z):
-        u = F.relu(self.bn5(self.deconv4(z))); dout3 = u
-        u = F.relu(self.bn6(self.deconv3(u))); dout2 = u
-        u = F.relu(self.bn7(self.deconv2(u))); dout1 = u
+        u = F.relu(self.bn5(self.deconv4(z)));
+        dout3 = u
+        u = F.relu(self.bn6(self.deconv3(u)));
+        dout2 = u
+        u = F.relu(self.bn7(self.deconv2(u)));
+        dout1 = u
         x_rec = torch.sigmoid(self.bn8(self.deconv1(u)))
         return x_rec, (dout1, dout2, dout3)
 
@@ -266,12 +275,13 @@ class AutoencoderNet(nn.Module):
     def predict_fd_from_latent(self, z):
         return self.fd_head(z)
 
+
 class LitFractalAE(LightningModule):
     def __init__(self, rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD):
         super().__init__()
         self.save_hyperparameters()
         self.net = AutoencoderNet(num_classes=NUM_CLASSES)
-        self.ce  = nn.CrossEntropyLoss()
+        self.ce = nn.CrossEntropyLoss()
         self.mse = nn.MSELoss()
 
         self.train_loss_hist, self.val_acc_hist, self.val_loss_hist = [], [], []
@@ -289,8 +299,8 @@ class LitFractalAE(LightningModule):
         return base
 
     def _fd_loss(self, x, z):
-        fd_target = batch_fd_targets_from_images(x)   # (B,)
-        fd_pred   = self.net.predict_fd_from_latent(z)  # (B,)
+        fd_target = batch_fd_targets_from_images(x)  # (B,)
+        fd_pred = self.net.predict_fd_from_latent(z)  # (B,)
         return self.mse(fd_pred, fd_target)
 
     def training_step(self, batch, batch_idx):
@@ -298,50 +308,51 @@ class LitFractalAE(LightningModule):
         # об'єднуємо в один батч для реконструкції та FD (без розділення)
         x_all = torch.cat([x_l, x_u], dim=0)
 
-        z_all, (o1,o2,o3) = self.net.encode(x_all)
-        xrec_all, (d1,d2,d3) = self.net.decode(z_all)
+        z_all, (o1, o2, o3) = self.net.encode(x_all)
+        xrec_all, (d1, d2, d3) = self.net.decode(z_all)
 
-        loss_rec = self.reconstruction_loss(xrec_all, x_all, o1,d1, o2,d2, o3,d3)
-        loss_fd  = self._fd_loss(x_all, z_all)
+        loss_rec = self.reconstruction_loss(xrec_all, x_all, o1, d1, o2, d2, o3, d3)
+        loss_fd = self._fd_loss(x_all, z_all)
 
         # CE тільки по labeled частині
         B_l = x_l.size(0)
         logits_l = self.net.classify_from_latent(z_all[:B_l])
-        loss_ce  = self.ce(logits_l, y_l)
+        loss_ce = self.ce(logits_l, y_l)
 
         loss = loss_ce + loss_rec + self.hparams.lambda_fd * loss_fd
 
-        self.log("train/loss_total", loss,    on_epoch=True, prog_bar=True)
-        self.log("train/ce",         loss_ce, on_epoch=True)
-        self.log("train/rec",        loss_rec,on_epoch=True)
-        self.log("train/fd",         loss_fd, on_epoch=True)
+        self.log("train/loss_total", loss, on_epoch=True, prog_bar=True)
+        self.log("train/ce", loss_ce, on_epoch=True)
+        self.log("train/rec", loss_rec, on_epoch=True)
+        self.log("train/fd", loss_fd, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        z, (o1,o2,o3) = self.net.encode(x)
-        xrec, (d1,d2,d3) = self.net.decode(z)
+        z, (o1, o2, o3) = self.net.encode(x)
+        xrec, (d1, d2, d3) = self.net.decode(z)
 
-        loss_rec = self.reconstruction_loss(xrec, x, o1,d1, o2,d2, o3,d3)
-        loss_fd  = self._fd_loss(x, z)
-        logits   = self.net.classify_from_latent(z)
-        loss_ce  = self.ce(logits, y)
+        loss_rec = self.reconstruction_loss(xrec, x, o1, d1, o2, d2, o3, d3)
+        loss_fd = self._fd_loss(x, z)
+        logits = self.net.classify_from_latent(z)
+        loss_ce = self.ce(logits, y)
 
         loss = loss_ce + loss_rec + self.hparams.lambda_fd * loss_fd
-        acc  = (logits.argmax(dim=1) == y).float().mean()
 
-        self.log("val/acc",  acc,      on_epoch=True, prog_bar=True)
-        self.log("val/ce",   loss_ce,  on_epoch=True)
-        self.log("val/rec",  loss_rec, on_epoch=True)
-        self.log("val/fd",   loss_fd,  on_epoch=True)
-        self.log("val/loss", loss,     on_epoch=True, prog_bar=True)
+        acc = (logits.argmax(dim=1) == y).float().mean()
+
+        self.log("val/acc", acc, on_epoch=True, prog_bar=True)
+        self.log("val/ce", loss_ce, on_epoch=True)
+        self.log("val/rec", loss_rec, on_epoch=True)
+        self.log("val/fd", loss_fd, on_epoch=True)
+        self.log("val/loss", loss, on_epoch=True, prog_bar=True)
         return {"val_loss": loss.detach(), "val_acc": acc.detach()}
 
     def on_validation_epoch_end(self):
         val_loss = self.trainer.callback_metrics.get("val/loss")
-        val_acc  = self.trainer.callback_metrics.get("val/acc")
+        val_acc = self.trainer.callback_metrics.get("val/acc")
         if val_loss is not None: self.val_loss_hist.append(float(val_loss.cpu()))
-        if val_acc  is not None: self.val_acc_hist.append(float(val_acc.cpu()))
+        if val_acc is not None: self.val_acc_hist.append(float(val_acc.cpu()))
         train_loss = self.trainer.callback_metrics.get("train/loss_total")
         if train_loss is not None: self.train_loss_hist.append(float(train_loss.cpu()))
 
@@ -362,32 +373,39 @@ class LitFractalAE(LightningModule):
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
 
+
 # =======================
 # Plot helpers
 # =======================
 def plot_and_save(history, title, ylabel, path_png):
-    plt.figure(figsize=(8,5))
+    plt.figure(figsize=(8, 5))
     plt.plot(history)
-    plt.title(title); plt.xlabel("Epoch"); plt.ylabel(ylabel)
+    plt.title(title);
+    plt.xlabel("Epoch");
+    plt.ylabel(ylabel)
     plt.grid(True, alpha=0.3)
-    plt.tight_layout(); plt.savefig(path_png, dpi=160); plt.close()
+    plt.tight_layout();
+    plt.savefig(path_png, dpi=160);
+    plt.close()
+
 
 # =======================
 # Main
 # =======================
 def main():
     dm = HAMDataModule(batch_size=BATCH_SIZE)
-    dm.prepare_data(); dm.setup()
+    dm.prepare_data();
+    dm.setup()
 
     model = LitFractalAE(rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD)
 
     ckpt = ModelCheckpoint(
         dirpath="models",
-        filename="ae-fractal-unified-{epoch:02d}-{val_acc:.4f}",
+        filename=MODEL_PATH + "-{epoch:02d}-{val_acc:.4f}",
         monitor="val/acc", mode="max", save_top_k=1
     )
     lrmon = LearningRateMonitor(logging_interval='epoch')
-    logger = CSVLogger("models", name="lightning_logs_fractal_unified")
+    logger = CSVLogger("models", name="lightning_logs_{}".format(MODEL_PATH))
 
     trainer = Trainer(
         max_epochs=NUM_EPOCHS,
@@ -399,21 +417,23 @@ def main():
         deterministic=True,
     )
 
-    print("DATA_PATH:", DATA_PATH); print(os.listdir(DATA_PATH))
+    print("DATA_PATH:", DATA_PATH);
+    print(os.listdir(DATA_PATH))
     trainer.fit(model, dm)
     trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path if ckpt.best_model_path else None)
 
     torch.save(model.state_dict(), os.path.join("models", MODEL_PATH))
 
     plot_and_save(model.train_loss_hist, "Train Loss (total)", "Loss", os.path.join("plots", "fru_train_loss.png"))
-    plot_and_save(model.val_loss_hist,   "Validation Loss",   "Loss", os.path.join("plots", "fru_val_loss.png"))
-    plot_and_save(model.val_acc_hist,    "Validation Acc",    "Accuracy", os.path.join("plots", "fru_val_acc.png"))
+    plot_and_save(model.val_loss_hist, "Validation Loss", "Loss", os.path.join("plots", "fru_val_loss.png"))
+    plot_and_save(model.val_acc_hist, "Validation Acc", "Accuracy", os.path.join("plots", "fru_val_acc.png"))
 
     print("\nSaved:")
     print(" - Best checkpoint:", ckpt.best_model_path if ckpt.best_model_path else "(none)")
     print(" - Latest state_dict: models/{}".format(MODEL_PATH))
     print(" - Plots: plots/fru_train_loss.png, plots/fru_val_loss.png, plots/fru_val_acc.png")
-    print(" - Test report: models/test_report_fractal_unified.txt")
+    print(" - Test report: models/test_report_{}.txt".format(MODEL_PATH))
+
 
 if __name__ == "__main__":
     main()
