@@ -41,13 +41,13 @@ CSV_PATH = os.path.join(DATA_PATH, "GroundTruth.csv")
 BATCH_SIZE = 128
 IMG_SIZE = (96, 96)
 NUM_CLASSES = 2
-NUM_EPOCHS = 10
-LR = 1e-3
+NUM_EPOCHS = 50
+LR = 3e-4
 LABELED_FRACTION = 0.05
-MODEL_PATH = "fractal_reg_ae_005_fd5.pt"
+MODEL_NAME = "base_model"
 
 # Лише одна вага для FD (λ). Реконструкцію не масштабуємо додатково — як у базі.
-LAMBDA_FD = 2
+LAMBDA_FD = 0
 RC_RATE = 0.3  # вага проміжних MSE (out<->dout) усередині reconstruction_loss
 
 # нормалізація з базової моделі
@@ -367,7 +367,7 @@ class LitFractalAE(LightningModule):
         targs = torch.cat(self.test_targets).numpy()
         report = classification_report(targs, preds, digits=3)
         print("\n=== TEST CLASSIFICATION REPORT ===\n", report)
-        with open(os.path.join("models", "test_report_{}.txt".format(MODEL_PATH)), "w", encoding="utf-8") as f:
+        with open(os.path.join("models", "test_report_{}.txt".format(MODEL_NAME)), "w", encoding="utf-8") as f:
             f.write(report)
 
     def configure_optimizers(self):
@@ -401,11 +401,11 @@ def main():
 
     ckpt = ModelCheckpoint(
         dirpath="models",
-        filename=MODEL_PATH + "-{epoch:02d}-{val_acc:.4f}",
+        filename=MODEL_NAME + "-{epoch:02d}-{val_acc:.4f}",
         monitor="val/acc", mode="max", save_top_k=1
     )
     lrmon = LearningRateMonitor(logging_interval='epoch')
-    logger = CSVLogger("models", name="lightning_logs_{}".format(MODEL_PATH))
+    logger = CSVLogger("models", name="lightning_logs_{}".format(MODEL_NAME))
 
     trainer = Trainer(
         max_epochs=NUM_EPOCHS,
@@ -417,22 +417,22 @@ def main():
         deterministic=True,
     )
 
-    print("DATA_PATH:", DATA_PATH);
+    print("DATA_PATH:", DATA_PATH)
     print(os.listdir(DATA_PATH))
     trainer.fit(model, dm)
     trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path if ckpt.best_model_path else None)
 
-    torch.save(model.state_dict(), os.path.join("models", MODEL_PATH))
+    torch.save(model.state_dict(), os.path.join("models", "{}.pt".format(MODEL_NAME)))
 
-    plot_and_save(model.train_loss_hist, "Train Loss (total)", "Loss", os.path.join("plots", "fru_train_loss.png"))
-    plot_and_save(model.val_loss_hist, "Validation Loss", "Loss", os.path.join("plots", "fru_val_loss.png"))
-    plot_and_save(model.val_acc_hist, "Validation Acc", "Accuracy", os.path.join("plots", "fru_val_acc.png"))
+    plot_and_save(model.train_loss_hist, "Train Loss (total)", "Loss", os.path.join("plots", "{}_train_loss.png".format(MODEL_NAME)))
+    plot_and_save(model.val_loss_hist, "Validation Loss", "Loss", os.path.join("plots", "{}_val_loss.png".format(MODEL_NAME)))
+    plot_and_save(model.val_acc_hist, "Validation Acc", "Accuracy", os.path.join("plots", "{}_val_acc.png".format(MODEL_NAME)))
 
     print("\nSaved:")
     print(" - Best checkpoint:", ckpt.best_model_path if ckpt.best_model_path else "(none)")
-    print(" - Latest state_dict: models/{}".format(MODEL_PATH))
-    print(" - Plots: plots/fru_train_loss.png, plots/fru_val_loss.png, plots/fru_val_acc.png")
-    print(" - Test report: models/test_report_{}.txt".format(MODEL_PATH))
+    print(" - Latest state_dict: models/{}.pt".format(MODEL_NAME))
+    print(" - Plots: plots/{}_train_loss.png, plots/{}_val_loss.png, plots/{}_val_acc.png".format(MODEL_NAME, MODEL_NAME, MODEL_NAME))
+    print(" - Test report: models/test_report_{}.txt".format(MODEL_NAME))
 
 
 if __name__ == "__main__":
