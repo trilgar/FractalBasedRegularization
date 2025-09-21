@@ -44,11 +44,11 @@ NUM_CLASSES = 2
 NUM_EPOCHS = 50
 LR = 3e-4
 LABELED_FRACTION = 0.05
-MODEL_NAME = "base_model"
+MODEL_NAME = "fd_ham_l500_m005"
 
 # Лише одна вага для FD (λ). Реконструкцію не масштабуємо додатково — як у базі.
-LAMBDA_FD = 0
-RC_RATE = 0.3  # вага проміжних MSE (out<->dout) усередині reconstruction_loss
+LAMBDA_FD = 5
+RC_RATE = 0.1  # вага проміжних MSE (out<->dout) усередині reconstruction_loss
 
 # нормалізація з базової моделі
 norm_mean = [0.76303685, 0.54564613, 0.570045]
