@@ -1,9 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os
-import warnings
-
+import os, warnings
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -12,8 +10,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split
-
+from torch.utils.data import Dataset, DataLoader, Subset
 try:
     from lightning import LightningModule, LightningDataModule, Trainer, seed_everything
     from lightning.pytorch.callbacks import ModelCheckpoint, LearningRateMonitor
@@ -24,10 +21,10 @@ except Exception:
     from pytorch_lightning.loggers import CSVLogger
 
 from torchvision import transforms
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
 from sklearn.metrics import classification_report
-
 from PIL import Image
+
 from fd_functions import *  # your FD utils (box_counting etc.)
 
 # =======================
@@ -43,13 +40,13 @@ NUM_CLASSES      = 2
 NUM_EPOCHS       = 10
 LR               = 3e-4
 LABELED_FRACTION = 0.05
-MODEL_NAME       = "fd_isic_l200_m005"
+MODEL_NAME       = "fd_isic_l10_m005_r_030"
 
 # Fractal regularization
-LAMBDA_FD = 0
+LAMBDA_FD = 10
 RC_RATE   = 0.3   # intermediate recon MSE weight inside reconstruction loss
 
-# Normalization (use ImageNet stats here; swap to your custom if you prefer)
+# Normalization (ImageNet)
 norm_mean = [0.485, 0.456, 0.406]
 norm_std  = [0.229, 0.224, 0.225]
 
@@ -90,7 +87,7 @@ class ISICClsDataset(Dataset):
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        img_path = os.path.join(self.root, row["image"])  # image is "<isic_id>.jpg"
+        img_path = os.path.join(self.root, row["image"])
         X = Image.open(img_path).convert("RGB")
         y = int(row["label_idx"])
         if self.transform is not None:
@@ -98,17 +95,32 @@ class ISICClsDataset(Dataset):
         return X, torch.tensor(y, dtype=torch.long)
 
 class SemiSupervisedDataset(Dataset):
-    """Returns (labeled_x, labeled_y, unlabeled_x)."""
-    def __init__(self, labeled_ds: Dataset, unlabeled_ds: Dataset):
+    """
+    Returns (labeled_x, labeled_y, unlabeled_x).
+    Labeled indices are drawn with a target minority proportion p_min.
+    """
+    def __init__(self, labeled_ds: Dataset, unlabeled_ds: Dataset, labeled_labels, p_min=0.5):
         self.labeled_ds = labeled_ds
         self.unlabeled_ds = unlabeled_ds
         self.labeled_size = len(labeled_ds)
         self.unlabeled_size = len(unlabeled_ds)
 
-    def __len__(self): return self.unlabeled_size
+        labeled_labels = np.asarray(labeled_labels)
+        self.min_idx = np.where(labeled_labels == 1)[0].astype(np.int64)
+        self.maj_idx = np.where(labeled_labels == 0)[0].astype(np.int64)
+        self.p_min = float(p_min)
+
+    def __len__(self):
+        return self.unlabeled_size  # drives batches
 
     def __getitem__(self, idx):
-        lx, ly = self.labeled_ds[idx % self.labeled_size]
+        # sample a labeled index with desired minority proportion
+        if (len(self.min_idx) > 0) and (np.random.rand() < self.p_min):
+            li = np.random.choice(self.min_idx)
+        else:
+            li = np.random.choice(self.maj_idx)
+
+        lx, ly = self.labeled_ds[int(li)]
         ux, _  = self.unlabeled_ds[idx]
         return lx, ly, ux
 
@@ -119,21 +131,18 @@ class ISICDataModule(LightningDataModule):
     def __init__(self, batch_size=BATCH_SIZE):
         super().__init__()
         self.batch_size = batch_size
+        self.ce_weights = None  # will be filled in setup()
 
     def prepare_data(self):
         df = pd.read_csv(CSV_PATH)
-
-        # Expect columns: 'isic_id', 'target' (0/1). Create unified columns.
         df["image"] = df["isic_id"].astype(str) + ".jpg"
         df["label_idx"] = df["target"].astype(int)
-
-        # Optional readable label column (not strictly needed)
         df["label"] = np.where(df["label_idx"] == 1, "Skin cancer", "Benign")
-
         df.drop_duplicates(subset=["isic_id"], inplace=True)
         self.df = df[["image", "label_idx", "label"]].reset_index(drop=True)
 
     def setup(self, stage=None):
+        # train / val / test (stratified)
         train_split = 0.9
         valid_split = 0.025
         valid_split_adj = valid_split / (1 - train_split)
@@ -145,17 +154,36 @@ class ISICDataModule(LightningDataModule):
             val_test_df, train_size=valid_split_adj, random_state=62, stratify=val_test_df["label_idx"]
         )
 
-        # (Keep the train distribution as-is; same behavior as your HAM script when max_size is large)
+        # Datasets
         self.train_full = ISICClsDataset(train_df, transform=train_transform, root=IM_DIR)
         self.val_set    = ISICClsDataset(val_df,   transform=eval_transform,  root=IM_DIR)
         self.test_set   = ISICClsDataset(test_df,  transform=eval_transform,  root=IM_DIR)
 
-        n_labeled   = int(LABELED_FRACTION * len(self.train_full))
-        n_unlabeled = len(self.train_full) - n_labeled
-        self.train_labeled, self.train_unlabeled = random_split(
-            self.train_full, [n_labeled, n_unlabeled], generator=torch.Generator().manual_seed(62)
+        # ---- Stratified labeled/unlabeled split (instead of random_split)
+        n_labeled = int(LABELED_FRACTION * len(train_df))
+        idx_all = np.arange(len(train_df))
+        y_all   = train_df["label_idx"].to_numpy()
+
+        sss = StratifiedShuffleSplit(n_splits=1, train_size=n_labeled, random_state=62)
+        labeled_idx, _ = next(sss.split(idx_all, y_all))
+        unlabeled_idx  = np.setdiff1d(idx_all, labeled_idx)
+
+        self.train_labeled   = Subset(self.train_full, labeled_idx.tolist())
+        self.train_unlabeled = Subset(self.train_full, unlabeled_idx.tolist())
+
+        # >>> PASS labeled_labels + p_min to SemiSupervisedDataset (FIX)
+        labeled_labels = y_all[labeled_idx]
+        self.semi_train = SemiSupervisedDataset(
+            self.train_labeled, self.train_unlabeled,
+            labeled_labels=labeled_labels, p_min=0.5
         )
-        self.semi_train = SemiSupervisedDataset(self.train_labeled, self.train_unlabeled)
+
+        # ---- Class weights computed on the labeled subset
+        counts = np.bincount(labeled_labels, minlength=NUM_CLASSES).astype(np.float32)  # [N0, N1]
+        inv = 1.0 / (counts + 1e-9)
+        inv = inv / inv.mean()
+        self.ce_weights = torch.tensor(inv, dtype=torch.float32)
+        print(f"Labeled counts: {counts.tolist()}  -> CE weights: {inv.tolist()}")
 
     def train_dataloader(self):
         return DataLoader(self.semi_train, batch_size=self.batch_size, shuffle=True,
@@ -207,7 +235,7 @@ def batch_fd_targets_from_images(x: torch.Tensor) -> torch.Tensor:
     return torch.tensor(fds, device=device, dtype=torch.float32)
 
 # =======================
-# Model (AE + FD head) — unchanged
+# Model (AE + FD head)
 # =======================
 class FDRegressor(nn.Module):
     def __init__(self, latent_channels=256, p_drop=0.1):
@@ -274,13 +302,20 @@ class AutoencoderNet(nn.Module):
         return self.fd_head(z)
 
 class LitFractalAE(LightningModule):
-    def __init__(self, rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD):
+    def __init__(self, rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD, ce_weights=None):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["ce_weights"])
         self.net = AutoencoderNet(num_classes=NUM_CLASSES)
-        self.ce  = nn.CrossEntropyLoss()
-        self.mse = nn.MSELoss()
 
+        # ----- class-weighted CE (register buffer so Lightning moves it to GPU) (FIX)
+        if ce_weights is None:
+            ce_weights = torch.ones(NUM_CLASSES, dtype=torch.float32)
+        elif not isinstance(ce_weights, torch.Tensor):
+            ce_weights = torch.tensor(ce_weights, dtype=torch.float32)
+        self.register_buffer("class_weights", ce_weights)
+        self.ce  = nn.CrossEntropyLoss(weight=self.class_weights)
+
+        self.mse = nn.MSELoss()
         self.train_loss_hist, self.val_acc_hist, self.val_loss_hist = [], [], []
         self.test_preds, self.test_targets = [], []
 
@@ -291,11 +326,13 @@ class LitFractalAE(LightningModule):
     def reconstruction_loss(self, x_rec, x_in, out1, dout1, out2, dout2, out3, dout3):
         base = self.mse(x_rec, x_in)
         if self.hparams.rc_rate:
-            base = base + self.hparams.rc_rate * (self.mse(out1, dout1) + self.mse(out2, dout2) + self.mse(out3, dout3))
+            base = base + self.hparams.rc_rate * (
+                self.mse(out1, dout1) + self.mse(out2, dout2) + self.mse(out3, dout3)
+            )
         return base
 
     def _fd_loss(self, x, z):
-        fd_target = batch_fd_targets_from_images(x)  # (B,)
+        fd_target = batch_fd_targets_from_images(x)   # (B,)
         fd_pred   = self.net.predict_fd_from_latent(z)  # (B,)
         return self.mse(fd_pred, fd_target)
 
@@ -303,8 +340,8 @@ class LitFractalAE(LightningModule):
         x_l, y_l, x_u = batch
         x_all = torch.cat([x_l, x_u], dim=0)
 
-        z_all, (o1, o2, o3)      = self.net.encode(x_all)
-        xrec_all, (d1, d2, d3)   = self.net.decode(z_all)
+        z_all, (o1, o2, o3)    = self.net.encode(x_all)
+        xrec_all, (d1, d2, d3) = self.net.decode(z_all)
         loss_rec = self.reconstruction_loss(xrec_all, x_all, o1, d1, o2, d2, o3, d3)
         loss_fd  = self._fd_loss(x_all, z_all)
 
@@ -312,18 +349,19 @@ class LitFractalAE(LightningModule):
         logits_l = self.net.classify_from_latent(z_all[:B_l])
         loss_ce  = self.ce(logits_l, y_l)
 
+        # >>> use self.hparams.lambda_fd (FIX)
         loss = loss_ce + loss_rec + self.hparams.lambda_fd * loss_fd
 
-        self.log("train/loss_total", loss, on_epoch=True, prog_bar=True)
-        self.log("train/ce",         loss_ce,  on_epoch=True)
-        self.log("train/rec",        loss_rec, on_epoch=True)
-        self.log("train/fd",         loss_fd,  on_epoch=True)
+        self.log("train/loss_total", loss,    on_epoch=True, prog_bar=True)
+        self.log("train/ce",         loss_ce, on_epoch=True)
+        self.log("train/rec",        loss_rec,on_epoch=True)
+        self.log("train/fd",         loss_fd, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        z, (o1, o2, o3)   = self.net.encode(x)
-        xrec, (d1, d2, d3)= self.net.decode(z)
+        z, (o1, o2, o3)    = self.net.encode(x)
+        xrec, (d1, d2, d3) = self.net.decode(z)
 
         loss_rec = self.reconstruction_loss(xrec, x, o1, d1, o2, d2, o3, d3)
         loss_fd  = self._fd_loss(x, z)
@@ -363,7 +401,7 @@ class LitFractalAE(LightningModule):
             f.write(report)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr)
+        return torch.optim.Adam(self.parameters(), lr=LR)
 
 # =======================
 # Plot helpers
@@ -386,7 +424,8 @@ def main():
     dm = ISICDataModule(batch_size=BATCH_SIZE)
     dm.prepare_data(); dm.setup()
 
-    model = LitFractalAE(rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD)
+    model = LitFractalAE(rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD,
+                         ce_weights=getattr(dm, "ce_weights", None))
 
     ckpt  = ModelCheckpoint(
         dirpath="models",
