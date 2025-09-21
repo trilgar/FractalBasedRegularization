@@ -44,10 +44,10 @@ NUM_CLASSES = 2
 NUM_EPOCHS = 50
 LR = 3e-4
 LABELED_FRACTION = 0.05
-MODEL_NAME = "fd_ham_l500_m005"
+MODEL_NAME = "fd_ham_l400_m005_rc010"
 
 # Лише одна вага для FD (λ). Реконструкцію не масштабуємо додатково — як у базі.
-LAMBDA_FD = 5
+LAMBDA_FD = 4
 RC_RATE = 0.1  # вага проміжних MSE (out<->dout) усередині reconstruction_loss
 
 # нормалізація з базової моделі
@@ -367,7 +367,7 @@ class LitFractalAE(LightningModule):
         targs = torch.cat(self.test_targets).numpy()
         report = classification_report(targs, preds, digits=3)
         print("\n=== TEST CLASSIFICATION REPORT ===\n", report)
-        with open(os.path.join("models", "test_report_{}.txt".format(MODEL_NAME)), "w", encoding="utf-8") as f:
+        with open(os.path.join("saved_metrics", "test_report_{}.txt".format(MODEL_NAME)), "w", encoding="utf-8") as f:
             f.write(report)
 
     def configure_optimizers(self):
