@@ -26,25 +26,33 @@ from sklearn.metrics import classification_report
 from PIL import Image
 
 from fd_functions import *  # your FD utils (box_counting etc.)
+warnings.filterwarnings("ignore")
 
 # =======================
-# Config (ISIC)
+# Config (paths)
 # =======================
-DATA_PATH   = "F:/datasets/ISIC2024"
-IM_DIR      = os.path.join(DATA_PATH, "train-image", "image")
-CSV_PATH    = os.path.join(DATA_PATH, "train-metadata-balanced.csv")
+# ISIC2024
+ISIC_DATA_PATH = "F:/datasets/ISIC2024"
+ISIC_IM_DIR    = os.path.join(ISIC_DATA_PATH, "train-image", "image")
+ISIC_CSV_PATH  = os.path.join(ISIC_DATA_PATH, "train-metadata-balanced.csv")  # або original csv
 
+# SIIM-ISIC
+SIIM_DATA_PATH = "F:/datasets/SIIM_ISIC"
+SIIM_IM_DIR    = os.path.join(SIIM_DATA_PATH, "train")
+SIIM_CSV_PATH  = os.path.join(SIIM_DATA_PATH, "train.csv")  # ти прикріпив цей файл
+
+# Experiment setup
 BATCH_SIZE       = 128
 IMG_SIZE         = (96, 96)
 NUM_CLASSES      = 2
 NUM_EPOCHS       = 10
 LR               = 3e-4
 LABELED_FRACTION = 0.05
-MODEL_NAME       = "fd_isic_l10_m005_r_030"
+MODEL_NAME       = "base_model_siim_mixed_l0_m005_r_030"
 
 # Fractal regularization
-LAMBDA_FD = 10
-RC_RATE   = 0.3   # intermediate recon MSE weight inside reconstruction loss
+LAMBDA_FD = 0
+RC_RATE   = 0.3
 
 # Normalization (ImageNet)
 norm_mean = [0.485, 0.456, 0.406]
@@ -58,7 +66,7 @@ torch.set_float32_matmul_precision('high')
 torch.backends.cudnn.benchmark = True
 
 # =======================
-# Dataset & transforms
+# Transforms
 # =======================
 train_transform = transforms.Compose([
     transforms.Resize(IMG_SIZE),
@@ -69,25 +77,26 @@ train_transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(norm_mean, norm_std),
 ])
-
 eval_transform = transforms.Compose([
     transforms.Resize(IMG_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(norm_mean, norm_std),
 ])
 
-class ISICClsDataset(Dataset):
-    """Minimal classification dataset for ISIC that returns (X, y)."""
-    def __init__(self, df: pd.DataFrame, transform=None, root=IM_DIR):
+# =======================
+# Dataset
+# =======================
+class MixedClsDataset(Dataset):
+    """Працює по df із стовпчиками: abs_path, label_idx"""
+    def __init__(self, df: pd.DataFrame, transform=None):
         self.df = df.reset_index(drop=True)
         self.transform = transform
-        self.root = root
 
     def __len__(self): return len(self.df)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        img_path = os.path.join(self.root, row["image"])
+        img_path = row["abs_path"]
         X = Image.open(img_path).convert("RGB")
         y = int(row["label_idx"])
         if self.transform is not None:
@@ -95,10 +104,7 @@ class ISICClsDataset(Dataset):
         return X, torch.tensor(y, dtype=torch.long)
 
 class SemiSupervisedDataset(Dataset):
-    """
-    Returns (labeled_x, labeled_y, unlabeled_x).
-    Labeled indices are drawn with a target minority proportion p_min.
-    """
+    """(labeled_x, labeled_y, unlabeled_x) з контролем частки міноритарного класу серед labeled."""
     def __init__(self, labeled_ds: Dataset, unlabeled_ds: Dataset, labeled_labels, p_min=0.5):
         self.labeled_ds = labeled_ds
         self.unlabeled_ds = unlabeled_ds
@@ -111,38 +117,97 @@ class SemiSupervisedDataset(Dataset):
         self.p_min = float(p_min)
 
     def __len__(self):
-        return self.unlabeled_size  # drives batches
+        return self.unlabeled_size
 
     def __getitem__(self, idx):
-        # sample a labeled index with desired minority proportion
         if (len(self.min_idx) > 0) and (np.random.rand() < self.p_min):
             li = np.random.choice(self.min_idx)
         else:
             li = np.random.choice(self.maj_idx)
-
         lx, ly = self.labeled_ds[int(li)]
         ux, _  = self.unlabeled_ds[idx]
         return lx, ly, ux
 
 # =======================
-# DataModule (ISIC)
+# Helpers to load/align CSVs
 # =======================
-class ISICDataModule(LightningDataModule):
+def _exists(p):
+    try:
+        return os.path.isfile(p)
+    except Exception:
+        return False
+
+def load_isic2024_df():
+    df = pd.read_csv(ISIC_CSV_PATH)
+    # очікуємо 'isic_id', 'target'
+    df["image"]     = df["isic_id"].astype(str) + ".jpg"
+    df["abs_path"]  = df["image"].apply(lambda n: os.path.join(ISIC_IM_DIR, n))
+    df["label_idx"] = df["target"].astype(int)
+    df["source"]    = "isic2024"
+    # прибрати дублі/биті шляхи
+    df = df.drop_duplicates(subset=["image"])
+    df = df[df["abs_path"].map(_exists)].reset_index(drop=True)
+    return df[["abs_path", "label_idx", "source"]]
+
+def load_siim_df():
+    df = pd.read_csv(SIIM_CSV_PATH)
+    # у SIIM зазвичай є 'image_name' і 'target'
+    # fallback: якщо 'target' нема, беремо 'benign_malignant'
+    if "target" in df.columns:
+        labels = df["target"].astype(int)
+    elif "benign_malignant" in df.columns:
+        labels = (df["benign_malignant"].astype(str).str.lower() == "malignant").astype(int)
+    else:
+        raise ValueError("SIIM CSV must have 'target' or 'benign_malignant' column.")
+
+    # file name
+    if "image_name" in df.columns:
+        names = df["image_name"].astype(str) + ".jpg"
+    elif "image" in df.columns:
+        names = df["image"].astype(str)
+        if not names.str.lower().str.endswith(".jpg").all():
+            names = names.astype(str) + ".jpg"
+    else:
+        raise ValueError("SIIM CSV must have 'image_name' (usual) or 'image' column.")
+
+    df2 = pd.DataFrame({
+        "image": names,
+        "label_idx": labels,
+    })
+    df2["abs_path"] = df2["image"].apply(lambda n: os.path.join(SIIM_IM_DIR, n))
+    df2["source"]   = "siim_isic"
+    df2 = df2.drop_duplicates(subset=["image"])
+    df2 = df2[df2["abs_path"].map(_exists)].reset_index(drop=True)
+    return df2[["abs_path", "label_idx", "source"]]
+
+# =======================
+# DataModule (Mixed: ISIC2024 + SIIM-ISIC)
+# =======================
+class MixedDataModule(LightningDataModule):
     def __init__(self, batch_size=BATCH_SIZE):
         super().__init__()
         self.batch_size = batch_size
-        self.ce_weights = None  # will be filled in setup()
+        self.ce_weights = None  # filled in setup()
 
     def prepare_data(self):
-        df = pd.read_csv(CSV_PATH)
-        df["image"] = df["isic_id"].astype(str) + ".jpg"
-        df["label_idx"] = df["target"].astype(int)
-        df["label"] = np.where(df["label_idx"] == 1, "Skin cancer", "Benign")
-        df.drop_duplicates(subset=["isic_id"], inplace=True)
-        self.df = df[["image", "label_idx", "label"]].reset_index(drop=True)
+        isic_df = load_isic2024_df()
+        siim_df = load_siim_df()
+
+        df_all = pd.concat([isic_df, siim_df], ignore_index=True)
+        df_all = df_all.dropna(subset=["abs_path", "label_idx"])
+        df_all["label_idx"] = df_all["label_idx"].astype(int)
+        df_all = df_all.reset_index(drop=True)
+
+        # Трохи статистики
+        print("\n=== Merged dataset stats ===")
+        print("Total:", len(df_all))
+        print("By source:\n", df_all["source"].value_counts())
+        print("Class counts:\n", df_all["label_idx"].value_counts())
+
+        self.df = df_all
 
     def setup(self, stage=None):
-        # train / val / test (stratified)
+        # Стратифікований split
         train_split = 0.9
         valid_split = 0.025
         valid_split_adj = valid_split / (1 - train_split)
@@ -155,11 +220,11 @@ class ISICDataModule(LightningDataModule):
         )
 
         # Datasets
-        self.train_full = ISICClsDataset(train_df, transform=train_transform, root=IM_DIR)
-        self.val_set    = ISICClsDataset(val_df,   transform=eval_transform,  root=IM_DIR)
-        self.test_set   = ISICClsDataset(test_df,  transform=eval_transform,  root=IM_DIR)
+        self.train_full = MixedClsDataset(train_df, transform=train_transform)
+        self.val_set    = MixedClsDataset(val_df,   transform=eval_transform)
+        self.test_set   = MixedClsDataset(test_df,  transform=eval_transform)
 
-        # ---- Stratified labeled/unlabeled split (instead of random_split)
+        # ---- Stratified labeled/unlabeled split (як і було) ----
         n_labeled = int(LABELED_FRACTION * len(train_df))
         idx_all = np.arange(len(train_df))
         y_all   = train_df["label_idx"].to_numpy()
@@ -171,34 +236,41 @@ class ISICDataModule(LightningDataModule):
         self.train_labeled   = Subset(self.train_full, labeled_idx.tolist())
         self.train_unlabeled = Subset(self.train_full, unlabeled_idx.tolist())
 
-        # >>> PASS labeled_labels + p_min to SemiSupervisedDataset (FIX)
         labeled_labels = y_all[labeled_idx]
         self.semi_train = SemiSupervisedDataset(
             self.train_labeled, self.train_unlabeled,
             labeled_labels=labeled_labels, p_min=0.5
         )
 
-        # ---- Class weights computed on the labeled subset
-        counts = np.bincount(labeled_labels, minlength=NUM_CLASSES).astype(np.float32)  # [N0, N1]
+        # ---- Class weights на labeled subset ----
+        counts = np.bincount(labeled_labels, minlength=NUM_CLASSES).astype(np.float32)
         inv = 1.0 / (counts + 1e-9)
         inv = inv / inv.mean()
         self.ce_weights = torch.tensor(inv, dtype=torch.float32)
         print(f"Labeled counts: {counts.tolist()}  -> CE weights: {inv.tolist()}")
 
+    def _dl_kwargs(self):
+        nw = min(max(4, (os.cpu_count() or 8) // 2), 12)  # 6-12 воркерів — хороша стартова точка на Windows
+        return dict(
+            batch_size=self.batch_size,
+            pin_memory=True,
+            pin_memory_device="cuda",
+            num_workers=nw,
+            prefetch_factor=4,  # ↑ з дефолтних 2
+            persistent_workers=True  # не перезапускає процеси воркерів кожну епоху
+        )
+
     def train_dataloader(self):
-        return DataLoader(self.semi_train, batch_size=self.batch_size, shuffle=True,
-                          pin_memory=True, num_workers=4, persistent_workers=True)
+        return DataLoader(self.semi_train, shuffle=True, **self._dl_kwargs())
 
     def val_dataloader(self):
-        return DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False,
-                          pin_memory=True, num_workers=4, persistent_workers=True)
+        return DataLoader(self.val_set, shuffle=False, **self._dl_kwargs())
 
     def test_dataloader(self):
-        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False,
-                          pin_memory=True, num_workers=4, persistent_workers=True)
+        return DataLoader(self.test_set, shuffle=False, **self._dl_kwargs())
 
 # =======================
-# FD targets helper
+# FD helpers (unchanged)
 # =======================
 @torch.no_grad()
 def batch_fd_targets_from_images(x: torch.Tensor) -> torch.Tensor:
@@ -235,7 +307,7 @@ def batch_fd_targets_from_images(x: torch.Tensor) -> torch.Tensor:
     return torch.tensor(fds, device=device, dtype=torch.float32)
 
 # =======================
-# Model (AE + FD head)
+# Model (AE + FD head) — unchanged
 # =======================
 class FDRegressor(nn.Module):
     def __init__(self, latent_channels=256, p_drop=0.1):
@@ -256,13 +328,13 @@ class AutoencoderNet(nn.Module):
         super().__init__()
         # Encoder
         self.conv1 = nn.Conv2d(3, 32, stride=1, kernel_size=1, padding=0)
-        self.bn1 = nn.BatchNorm2d(32)
+        self.bn1   = nn.BatchNorm2d(32)
         self.conv2 = nn.Conv2d(32, 64, stride=1, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
+        self.bn2   = nn.BatchNorm2d(64)
         self.conv3 = nn.Conv2d(64, 128, stride=4, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
+        self.bn3   = nn.BatchNorm2d(128)
         self.conv4 = nn.Conv2d(128, 256, stride=4, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm2d(256)
+        self.bn4   = nn.BatchNorm2d(256)
         # Decoder
         self.deconv4 = nn.ConvTranspose2d(256, 128, stride=4, kernel_size=3, output_padding=1)
         self.bn5 = nn.BatchNorm2d(128)
@@ -307,7 +379,6 @@ class LitFractalAE(LightningModule):
         self.save_hyperparameters(ignore=["ce_weights"])
         self.net = AutoencoderNet(num_classes=NUM_CLASSES)
 
-        # ----- class-weighted CE (register buffer so Lightning moves it to GPU) (FIX)
         if ce_weights is None:
             ce_weights = torch.ones(NUM_CLASSES, dtype=torch.float32)
         elif not isinstance(ce_weights, torch.Tensor):
@@ -332,8 +403,8 @@ class LitFractalAE(LightningModule):
         return base
 
     def _fd_loss(self, x, z):
-        fd_target = batch_fd_targets_from_images(x)   # (B,)
-        fd_pred   = self.net.predict_fd_from_latent(z)  # (B,)
+        fd_target = batch_fd_targets_from_images(x)
+        fd_pred   = self.net.predict_fd_from_latent(z)
         return self.mse(fd_pred, fd_target)
 
     def training_step(self, batch, batch_idx):
@@ -349,7 +420,6 @@ class LitFractalAE(LightningModule):
         logits_l = self.net.classify_from_latent(z_all[:B_l])
         loss_ce  = self.ce(logits_l, y_l)
 
-        # >>> use self.hparams.lambda_fd (FIX)
         loss = loss_ce + loss_rec + self.hparams.lambda_fd * loss_fd
 
         self.log("train/loss_total", loss,    on_epoch=True, prog_bar=True)
@@ -397,7 +467,7 @@ class LitFractalAE(LightningModule):
         targs = torch.cat(self.test_targets).numpy()
         report = classification_report(targs, preds, digits=3)
         print("\n=== TEST CLASSIFICATION REPORT ===\n", report)
-        with open(os.path.join("saved_metrics", f"test_report_{MODEL_NAME}.txt"), "w", encoding="utf-8") as f:
+        with open(os.path.join("models", f"test_report_{MODEL_NAME}.txt"), "w", encoding="utf-8") as f:
             f.write(report)
 
     def configure_optimizers(self):
@@ -421,7 +491,7 @@ def plot_and_save(history, title, ylabel, path_png):
 # Main
 # =======================
 def main():
-    dm = ISICDataModule(batch_size=BATCH_SIZE)
+    dm = MixedDataModule(batch_size=BATCH_SIZE)
     dm.prepare_data(); dm.setup()
 
     model = LitFractalAE(rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD,
@@ -445,9 +515,10 @@ def main():
         deterministic=True,
     )
 
-    print("DATA_PATH:", DATA_PATH)
-    print("CSV:", CSV_PATH)
-    print("Images dir exists:", os.path.isdir(IM_DIR))
+    print("ISIC dir exists:", os.path.isdir(ISIC_IM_DIR))
+    print("SIIM dir exists:", os.path.isdir(SIIM_IM_DIR))
+    print("ISIC CSV:", ISIC_CSV_PATH)
+    print("SIIM CSV:", SIIM_CSV_PATH)
 
     trainer.fit(model, dm)
     trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path if ckpt.best_model_path else None)
