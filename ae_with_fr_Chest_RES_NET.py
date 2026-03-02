@@ -46,12 +46,12 @@ TEST_LIST   = os.path.join(DATA_PATH, "test.txt")
 IMG_SIZE         = (512, 512)    # <-- requested 512x512
 BATCH_SIZE       = 16
 NUM_CLASSES      = 2
-NUM_EPOCHS       = 1
+NUM_EPOCHS       = 5
 LR               = 2e-4
 
 # Semi-supervised + regularization
 LABELED_FRACTION = 0.05
-LAMBDA_FD        = 10
+LAMBDA_FD        = 40
 RC_RATE          = 0.1
 
 r_str = fmt_pct_three(RC_RATE, "r")
