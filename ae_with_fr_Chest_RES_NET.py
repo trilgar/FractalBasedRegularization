@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import os, warnings
+import os, warnings, gc
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -28,7 +28,6 @@ from sklearn.metrics import classification_report, fbeta_score
 from torchmetrics import FBetaScore
 from PIL import Image
 
-
 # =======================
 # Utils
 # =======================
@@ -38,7 +37,7 @@ def fmt_pct_three(val: float, prefix: str) -> str:
 
 
 # =======================
-# Config (Chest X-ray)
+# Config (Kaggle Version)
 # =======================
 DATA_PATH = "F:/datasets/Chest X-Ray"
 TRAIN_DIR = os.path.join(DATA_PATH, "train")
@@ -53,22 +52,23 @@ NUM_CLASSES = 2
 NUM_EPOCHS = 10
 LR = 1e-3
 
-# Semi-supervised + regularization
+# Semi-supervised + regularization static parameters
 LABELED_FRACTION = 0.05
-LAMBDA_FD = 40
 RC_RATE = 0.1
-
-r_str = fmt_pct_three(RC_RATE, "r")
-m_str = fmt_pct_three(LABELED_FRACTION, "m")
-MODEL_NAME = f"fd_resnetAE_512_l{LAMBDA_FD}_{m_str}_{r_str}"
 
 # ImageNet normalization
 norm_mean = [0.485, 0.456, 0.406]
 norm_std = [0.229, 0.224, 0.225]
 
-os.makedirs("models", exist_ok=True)
-os.makedirs("plots", exist_ok=True)
-os.makedirs("saved_metrics", exist_ok=True)
+# Kaggle Output Directories (must be in /kaggle/working/)
+OUTPUT_DIR = "."
+MODELS_DIR = os.path.join(OUTPUT_DIR, "models")
+PLOTS_DIR = os.path.join(OUTPUT_DIR, "plots")
+METRICS_DIR = os.path.join(OUTPUT_DIR, "saved_metrics")
+
+os.makedirs(MODELS_DIR, exist_ok=True)
+os.makedirs(PLOTS_DIR, exist_ok=True)
+os.makedirs(METRICS_DIR, exist_ok=True)
 
 seed_everything(10, workers=True)
 torch.set_float32_matmul_precision('high')
@@ -77,7 +77,6 @@ torch.backends.cudnn.benchmark = True
 # =======================
 # Transforms & dataset
 # =======================
-# Added more aggressive augmentations from the baseline
 train_transform = transforms.Compose([
     transforms.Resize(IMG_SIZE),
     transforms.RandomRotation(20),
@@ -320,7 +319,7 @@ class ResNet18AE(nn.Module):
 # Lightning module
 # =======================
 class LitFractalAE(LightningModule):
-    def __init__(self, rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD, ce_weights=None):
+    def __init__(self, rc_rate=RC_RATE, lr=LR, lambda_fd=40, ce_weights=None):
         super().__init__()
         self.save_hyperparameters(ignore=["ce_weights"])
         self.net = ResNet18AE(num_classes=NUM_CLASSES, pretrained=True)
@@ -334,7 +333,6 @@ class LitFractalAE(LightningModule):
         self.ce = nn.CrossEntropyLoss(weight=self.class_weights)
         self.mse = nn.MSELoss()
 
-        # Initialize the F2 Metric
         self.f2_metric = FBetaScore(task="multiclass", num_classes=NUM_CLASSES, beta=2.0, average="macro")
 
         self.train_loss_hist, self.val_f2_hist, self.val_loss_hist = [], [], []
@@ -395,7 +393,6 @@ class LitFractalAE(LightningModule):
 
         loss = loss_ce + loss_rec + self.hparams.lambda_fd * loss_fd
 
-        # Calculate F2 Score
         preds_class = logits.argmax(dim=1)
         f2 = self.f2_metric(preds_class, y)
 
@@ -427,7 +424,6 @@ class LitFractalAE(LightningModule):
         preds = torch.cat(self.test_preds).numpy()
         targs = torch.cat(self.test_targets).numpy()
 
-        # Fixed explicit order: Class 0 is negative, Class 1 is positive
         report = classification_report(targs, preds, digits=3, target_names=["negative", "positive"])
 
         f2_macro = fbeta_score(targs, preds, beta=2.0, average='macro')
@@ -441,7 +437,10 @@ class LitFractalAE(LightningModule):
         final_report = report + custom_metrics
 
         print("\n=== TEST CLASSIFICATION REPORT ===\n", final_report)
-        with open(os.path.join("saved_metrics", f"test_report_{MODEL_NAME}.txt"), "w", encoding="utf-8") as f:
+
+        # Save report text to the Kaggle METRICS_DIR
+        with open(os.path.join(METRICS_DIR, f"test_report_{self.hparams.model_name}.txt"), "w",
+                  encoding="utf-8") as f:
             f.write(final_report)
 
     def configure_optimizers(self):
@@ -477,25 +476,33 @@ def plot_and_save(history, title, ylabel, path_png):
 
 
 # =======================
-# Main
+# Experiment Runner
 # =======================
-def main():
-    dm = ChestXRayDataModule(batch_size=BATCH_SIZE)
-    dm.prepare_data()
-    dm.setup()
+def run_experiment(lambda_fd: int, dm: ChestXRayDataModule):
+    print(f"\n{'=' * 60}")
+    print(f"STARTING EXPERIMENT WITH LAMBDA_FD = {lambda_fd}")
+    print(f"{'=' * 60}\n")
 
-    model = LitFractalAE(rc_rate=RC_RATE, lr=LR, lambda_fd=LAMBDA_FD,
+    # Generate dynamic model name
+    r_str = fmt_pct_three(RC_RATE, "r")
+    m_str = fmt_pct_three(LABELED_FRACTION, "m")
+    current_model_name = f"fd_resnetAE_512_l{lambda_fd}_{m_str}_{r_str}"
+
+    model = LitFractalAE(rc_rate=RC_RATE, lr=LR, lambda_fd=lambda_fd,
                          ce_weights=getattr(dm, "ce_weights", None))
+    # Pass the name to hparams so the test step can use it to save the text report
+    model.hparams.model_name = current_model_name
 
-    # Checkpoint now monitors val/f2
+    # Save checkpoints to the Kaggle MODELS_DIR
     ckpt = ModelCheckpoint(
-        dirpath="models",
-        filename=MODEL_NAME + "-{epoch:02d}-{val_f2:.4f}",
+        dirpath=MODELS_DIR,
+        filename=current_model_name + "-{epoch:02d}-{val_f2:.4f}",
         monitor="val/f2", mode="max", save_top_k=1
     )
 
     lrmon = LearningRateMonitor(logging_interval='epoch')
-    logger = CSVLogger("models", name=f"lightning_logs_{MODEL_NAME}")
+    # Save logs to the Kaggle MODELS_DIR
+    logger = CSVLogger(MODELS_DIR, name=f"lightning_logs_{current_model_name}")
 
     trainer = Trainer(
         max_epochs=NUM_EPOCHS,
@@ -507,29 +514,56 @@ def main():
         deterministic=True,
     )
 
+    # Train and test
+    trainer.fit(model, dm)
+    trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path if ckpt.best_model_path else "best")
+
+    # Save model weights to Kaggle MODELS_DIR
+    torch.save(model.state_dict(), os.path.join(MODELS_DIR, f"{current_model_name}.pt"))
+
+    # Generate plots and save to Kaggle PLOTS_DIR
+    plot_and_save(model.train_loss_hist, f"Train Loss (L_FD={lambda_fd})", "Loss",
+                  os.path.join(PLOTS_DIR, f"{current_model_name}_train_loss.png"))
+    plot_and_save(model.val_loss_hist, f"Validation Loss (L_FD={lambda_fd})", "Loss",
+                  os.path.join(PLOTS_DIR, f"{current_model_name}_val_loss.png"))
+    plot_and_save(model.val_f2_hist, f"Validation F2 Score (L_FD={lambda_fd})", "F2 Score",
+                  os.path.join(PLOTS_DIR, f"{current_model_name}_val_f2.png"))
+
+    print(f"\nSaved assets for LAMBDA_FD = {lambda_fd}:")
+    print(f" - Best checkpoint: {ckpt.best_model_path if ckpt.best_model_path else '(none)'}")
+    print(f" - Latest state_dict: {MODELS_DIR}/{current_model_name}.pt")
+
+    # Cleanup memory for the next loop
+    del model
+    del trainer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# =======================
+# Main
+# =======================
+def main():
     print("DATA_PATH:", DATA_PATH)
     print("Train dir exists:", os.path.isdir(TRAIN_DIR))
     print("Test dir exists:", os.path.isdir(TEST_DIR))
     print("TRAIN_CSV exists:", os.path.isfile(TRAIN_CSV))
     print("TEST_CSV exists:", os.path.isfile(TEST_CSV))
 
-    trainer.fit(model, dm)
-    trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path if ckpt.best_model_path else "best")
+    # Initialize and prepare DataModule ONLY ONCE
+    print("\nPreparing DataModule...")
+    dm = ChestXRayDataModule(batch_size=BATCH_SIZE)
+    dm.prepare_data()
+    dm.setup()
 
-    torch.save(model.state_dict(), os.path.join("models", f"{MODEL_NAME}.pt"))
+    # Define the list of lambda parameters to test
+    lambda_values = [5]
 
-    plot_and_save(model.train_loss_hist, "Train Loss (total)", "Loss",
-                  os.path.join("plots", f"{MODEL_NAME}_train_loss.png"))
-    plot_and_save(model.val_loss_hist, "Validation Loss", "Loss", os.path.join("plots", f"{MODEL_NAME}_val_loss.png"))
-    plot_and_save(model.val_f2_hist, "Validation F2 Score", "F2 Score",
-                  os.path.join("plots", f"{MODEL_NAME}_val_f2.png"))
+    # Run them sequentially
+    for l_fd in lambda_values:
+        run_experiment(l_fd, dm)
 
-    print("\nSaved:")
-    print(" - Best checkpoint:", ckpt.best_model_path if ckpt.best_model_path else "(none)")
-    print(" - Latest state_dict:", f"models/{MODEL_NAME}.pt")
-    print(" - Plots:",
-          f"plots/{MODEL_NAME}_train_loss.png, plots/{MODEL_NAME}_val_loss.png, plots/{MODEL_NAME}_val_f2.png")
-    print(" - Test report:", f"saved_metrics/test_report_{MODEL_NAME}.txt")
+    print("\nAll experiments completed successfully!")
 
 
 if __name__ == "__main__":
