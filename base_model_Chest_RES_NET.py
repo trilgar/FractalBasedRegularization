@@ -23,8 +23,9 @@ except Exception:
 
 from torchvision import transforms, models
 from sklearn.model_selection import train_test_split, StratifiedShuffleSplit
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report, fbeta_score
 from PIL import Image
+from torchmetrics import FBetaScore
 
 
 # =======================
@@ -49,7 +50,7 @@ IMG_SIZE = (512, 512)
 BATCH_SIZE = 16
 NUM_CLASSES = 2
 NUM_EPOCHS = 10
-LR = 1e-3 # Збільшимо початкову LR, оскільки планувальник буде її зменшувати
+LR = 1e-3
 LABELED_FRACTION = 0.05
 
 m_str = fmt_pct_three(LABELED_FRACTION, "m")
@@ -250,7 +251,10 @@ class LitClassifier(LightningModule):
         self.register_buffer("class_weights", ce_weights)
         self.ce = nn.CrossEntropyLoss(weight=self.class_weights)
 
-        self.train_loss_hist, self.val_acc_hist, self.val_loss_hist = [], [], []
+        # Initialize the F2 Metric
+        self.f2_metric = FBetaScore(task="multiclass", num_classes=NUM_CLASSES, beta=2.0, average="macro")
+
+        self.train_loss_hist, self.val_f2_hist, self.val_loss_hist = [], [], []
         self.test_preds, self.test_targets = [], []
 
     def forward(self, x):
@@ -267,16 +271,21 @@ class LitClassifier(LightningModule):
         x, y = batch
         logits = self.forward(x)
         loss = self.ce(logits, y)
-        acc = (logits.argmax(dim=1) == y).float().mean()
-        self.log("val/acc", acc, on_epoch=True, prog_bar=True)
+        preds = logits.argmax(dim=1)
+
+        # Calculate F2
+        f2 = self.f2_metric(preds, y)
+
+        self.log("val/f2", f2, on_epoch=True, prog_bar=True)
         self.log("val/loss", loss, on_epoch=True, prog_bar=True)
-        return {"val_loss": loss.detach(), "val_acc": acc.detach()}
+
+        return {"val_loss": loss.detach(), "val_f2": f2.detach()}
 
     def on_validation_epoch_end(self):
         val_loss = self.trainer.callback_metrics.get("val/loss")
         val_acc = self.trainer.callback_metrics.get("val/acc")
         if val_loss is not None: self.val_loss_hist.append(float(val_loss.cpu()))
-        if val_acc is not None: self.val_acc_hist.append(float(val_acc.cpu()))
+        if val_acc is not None: self.val_f2_hist.append(float(val_acc.cpu()))
         train_loss = self.trainer.callback_metrics.get("train/loss")
         if train_loss is not None: self.train_loss_hist.append(float(train_loss.cpu()))
 
@@ -289,10 +298,21 @@ class LitClassifier(LightningModule):
     def on_test_epoch_end(self):
         preds = torch.cat(self.test_preds).numpy()
         targs = torch.cat(self.test_targets).numpy()
-        report = classification_report(targs, preds, digits=3, target_names=list(_LABEL_MAP.keys()))
-        print("\n=== TEST CLASSIFICATION REPORT ===\n", report)
-        with open(os.path.join("saved_metrics", f"test_report_{MODEL_NAME}.txt"), "w", encoding="utf-8") as f:
-            f.write(report)
+
+        # FIX: explicitly order names for Class 0, then Class 1
+        report = classification_report(targs, preds, digits=3, target_names=["negative", "positive"])
+
+        f2_macro = fbeta_score(targs, preds, beta=2.0, average='macro')
+        f2_positive = fbeta_score(targs, preds, beta=2.0, average='binary', pos_label=1)
+
+        custom_metrics = (
+            f"\n--- Custom F2 Metrics ---\n"
+            f"Macro F2-score    : {f2_macro:.3f}\n"
+            f"Positive Class F2 : {f2_positive:.3f}\n"
+        )
+        final_report = report + custom_metrics
+
+        print("\n=== TEST CLASSIFICATION REPORT ===\n", final_report)
 
     # ### ОНОВЛЕНИЙ ОПТИМІЗАТОР З ПЛАНУВАЛЬНИКОМ ###
     def configure_optimizers(self):
@@ -307,7 +327,7 @@ class LitClassifier(LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {
                 "scheduler": scheduler,
-                "monitor": "val/acc", # Слідкувати за val_acc
+                "monitor": "val/f2",
             },
         }
 
@@ -338,8 +358,10 @@ def main():
 
     ckpt = ModelCheckpoint(
         dirpath="models",
-        filename=MODEL_NAME + "-{epoch:02d}-{val_acc:.4f}",
-        monitor="val/acc", mode="max", save_top_k=1
+        filename=MODEL_NAME + "-{epoch:02d}-{val_f2:.4f}",
+        monitor="val/f2",
+        mode="max",
+        save_top_k=1
     )
     lrmon = LearningRateMonitor(logging_interval='step') # змінив на 'step' для кращого моніторингу
     logger = CSVLogger("models", name=f"lightning_logs_{MODEL_NAME}")
@@ -368,7 +390,7 @@ def main():
 
     plot_and_save(model.train_loss_hist, "Train Loss", "Loss", os.path.join("plots", f"{MODEL_NAME}_train_loss.png"))
     plot_and_save(model.val_loss_hist, "Validation Loss", "Loss", os.path.join("plots", f"{MODEL_NAME}_val_loss.png"))
-    plot_and_save(model.val_acc_hist, "Validation Accuracy", "Accuracy",
+    plot_and_save(model.val_f2_hist, "Validation Accuracy", "Accuracy",
                   os.path.join("plots", f"{MODEL_NAME}_val_acc.png"))
 
     print("\nSaved:")
