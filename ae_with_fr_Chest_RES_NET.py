@@ -37,9 +37,10 @@ def fmt_pct_three(val: float, prefix: str) -> str:
 
 
 # =======================
-# Config (Kaggle Version)
+# Config (Local Version)
 # =======================
 DATA_PATH = "F:/datasets/Chest X-Ray"
+
 TRAIN_DIR = os.path.join(DATA_PATH, "train")
 TEST_DIR = os.path.join(DATA_PATH, "test")
 
@@ -60,7 +61,7 @@ RC_RATE = 0.1
 norm_mean = [0.485, 0.456, 0.406]
 norm_std = [0.229, 0.224, 0.225]
 
-# Kaggle Output Directories (must be in /kaggle/working/)
+# Local Output Directories (Using current directory '.')
 OUTPUT_DIR = "."
 MODELS_DIR = os.path.join(OUTPUT_DIR, "models")
 PLOTS_DIR = os.path.join(OUTPUT_DIR, "plots")
@@ -226,20 +227,22 @@ class ChestXRayDataModule(LightningDataModule):
 
 
 # =======================
-# Model: ResNet18-based AE
+# Model: ResNet18-based AE (with Feature Disentanglement)
 # =======================
 class FDRegressor(nn.Module):
-    def __init__(self, latent_channels=512):
+    # Тепер отримує лише 64 канали (просторову сітку 64x16x16)
+    def __init__(self, in_channels=64):
         super().__init__()
         self.model = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(latent_channels, 128),
+            nn.Linear(in_channels, 32), # Легка внутрішня розмірність
             nn.ReLU(inplace=True),
-            nn.Linear(128, 1)
+            nn.Linear(32, 1)
         )
 
-    def forward(self, z): return self.model(z).squeeze(1)
+    def forward(self, feature_map):
+        return self.model(feature_map).squeeze(1)
 
 
 class UpBlock(nn.Module):
@@ -286,19 +289,27 @@ class ResNet18AE(nn.Module):
         self.ad2 = nn.Conv2d(128, 128, 1)
         self.ad1 = nn.Conv2d(64, 64, 1)
 
-        self.cls_head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(512, num_classes))
-        self.fd_head = FDRegressor(512)
+        # DISENTANGLEMENT: Класифікатор читає тільки 448 каналів
+        self.cls_head = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Linear(448, num_classes)
+        )
+
+        # DISENTANGLEMENT: Регресор ФР читає тільки 64 канали
+        self.fd_head = FDRegressor(in_channels=64)
 
     def encode(self, x):
         x = self.enc_relu(self.enc_bn1(self.enc_conv1(x)))
         x = self.enc_maxp(x)
-        o1 = self.l1(x)  # 64,  1/4
-        o2 = self.l2(o1)  # 128, 1/8
-        o3 = self.l3(o2)  # 256, 1/16
-        z = self.l4(o3)  # 512, 1/32
+        o1 = self.l1(x)
+        o2 = self.l2(o1)
+        o3 = self.l3(o2)
+        z = self.l4(o3)  # Вектор на 512 каналів
         return z, (o1.detach(), o2.detach(), o3.detach())
 
     def decode(self, z):
+        # Декодер використовує всі 512 каналів для ідеальної реконструкції
         d3 = self.dec4(z)
         d2 = self.dec3(d3)
         d1 = self.dec2(d2)
@@ -309,10 +320,14 @@ class ResNet18AE(nn.Module):
         return xrec, (dout1, dout2, dout3)
 
     def classify_from_latent(self, z):
-        return self.cls_head(z)
+        # Фізичне розщеплення: беремо лише канали з індексами від 0 до 447
+        z_cls = z[:, :448]
+        return self.cls_head(z_cls)
 
     def predict_fd_from_latent(self, z):
-        return self.fd_head(z)
+        # Фізичне розщеплення: беремо лише канали з індексами від 448 до 511
+        z_fd = z[:, 448:]
+        return self.fd_head(z_fd)
 
 
 # =======================
@@ -356,14 +371,17 @@ class LitFractalAE(LightningModule):
         x_all = torch.cat([x_l, x_u], dim=0)
         fd_t_all = torch.cat([fd_l, fd_u], dim=0)
 
+        # 1. Енкодер видає спільний вектор z_all
         z_all, (o1, o2, o3) = self.net.encode(x_all)
         xrec_all, (d1, d2, d3) = self.net.decode(z_all)
 
         loss_rec = self.reconstruction_loss(xrec_all, x_all, o1, d1, o2, d2, o3, d3)
 
+        # 2. ФР-регресор читає свою половину (через метод predict_fd)
         fd_p_all = self.net.predict_fd_from_latent(z_all)
         loss_fd = self.mse(fd_p_all, fd_t_all)
 
+        # 3. Класифікатор читає свою половину (через метод classify_from_latent)
         B_l = x_l.size(0)
         logits_l = self.net.classify_from_latent(z_all[:B_l])
         loss_ce = self.ce(logits_l, y_l)
@@ -438,7 +456,7 @@ class LitFractalAE(LightningModule):
 
         print("\n=== TEST CLASSIFICATION REPORT ===\n", final_report)
 
-        # Save report text to the Kaggle METRICS_DIR
+        # Save report text using METRICS_DIR
         with open(os.path.join(METRICS_DIR, f"test_report_{self.hparams.model_name}.txt"), "w",
                   encoding="utf-8") as f:
             f.write(final_report)
@@ -493,7 +511,6 @@ def run_experiment(lambda_fd: int, dm: ChestXRayDataModule):
     # Pass the name to hparams so the test step can use it to save the text report
     model.hparams.model_name = current_model_name
 
-    # Save checkpoints to the Kaggle MODELS_DIR
     ckpt = ModelCheckpoint(
         dirpath=MODELS_DIR,
         filename=current_model_name + "-{epoch:02d}-{val_f2:.4f}",
@@ -501,7 +518,6 @@ def run_experiment(lambda_fd: int, dm: ChestXRayDataModule):
     )
 
     lrmon = LearningRateMonitor(logging_interval='epoch')
-    # Save logs to the Kaggle MODELS_DIR
     logger = CSVLogger(MODELS_DIR, name=f"lightning_logs_{current_model_name}")
 
     trainer = Trainer(
@@ -518,10 +534,10 @@ def run_experiment(lambda_fd: int, dm: ChestXRayDataModule):
     trainer.fit(model, dm)
     trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path if ckpt.best_model_path else "best")
 
-    # Save model weights to Kaggle MODELS_DIR
+    # Save model weights
     torch.save(model.state_dict(), os.path.join(MODELS_DIR, f"{current_model_name}.pt"))
 
-    # Generate plots and save to Kaggle PLOTS_DIR
+    # Generate plots
     plot_and_save(model.train_loss_hist, f"Train Loss (L_FD={lambda_fd})", "Loss",
                   os.path.join(PLOTS_DIR, f"{current_model_name}_train_loss.png"))
     plot_and_save(model.val_loss_hist, f"Validation Loss (L_FD={lambda_fd})", "Loss",
@@ -556,8 +572,9 @@ def main():
     dm.prepare_data()
     dm.setup()
 
-    # Define the list of lambda parameters to test
-    lambda_values = [5]
+    # Запускаємо експерименти з дуже обережними значеннями лямбда
+    # (можна розширити список, якщо ці пройдуть успішно)
+    lambda_values = [0.1, 0.5, 1.0, 5.0]
 
     # Run them sequentially
     for l_fd in lambda_values:
