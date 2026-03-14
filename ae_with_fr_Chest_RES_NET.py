@@ -574,7 +574,7 @@ def main():
 
     # Запускаємо експерименти з дуже обережними значеннями лямбда
     # (можна розширити список, якщо ці пройдуть успішно)
-    lambda_values = [0.1, 0.5, 1.0, 5.0]
+    lambda_values = [0.3, 0.4, 0.6, 0.7]
 
     # Run them sequentially
     for l_fd in lambda_values:
