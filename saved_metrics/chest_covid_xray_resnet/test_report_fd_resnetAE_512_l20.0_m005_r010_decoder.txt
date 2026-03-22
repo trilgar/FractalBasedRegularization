@@ -1,0 +1,12 @@
+              precision    recall  f1-score   support
+
+    negative      0.896     0.995     0.943       200
+    positive      0.994     0.885     0.937       200
+
+    accuracy                          0.940       400
+   macro avg      0.945     0.940     0.940       400
+weighted avg      0.945     0.940     0.940       400
+
+--- Custom F2 Metrics ---
+Macro F2-score    : 0.939
+Positive Class F2 : 0.905

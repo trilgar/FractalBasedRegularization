@@ -227,22 +227,18 @@ class ChestXRayDataModule(LightningDataModule):
 
 
 # =======================
-# Model: ResNet18-based AE (with Decoder-Side Regularization)
+# Model: ResNet18-based AE (with Feature Disentanglement)
 # =======================
 class FDRegressor(nn.Module):
-    def __init__(self, in_channels=128):
+    # Тепер отримує лише 64 канали (просторову сітку 64x16x16)
+    def __init__(self, in_channels=64):
         super().__init__()
-        # Використовуємо Conv2d для збереження просторової інформації перед пулінгом
         self.model = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 16, kernel_size=3, stride=2, padding=1, bias=False),
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(16, 1)
+            nn.Linear(in_channels, 32), # Легка внутрішня розмірність
+            nn.ReLU(inplace=True),
+            nn.Linear(32, 1)
         )
 
     def forward(self, feature_map):
@@ -263,6 +259,8 @@ class UpBlock(nn.Module):
 
 
 class ResNet18AE(nn.Module):
+    """Encoder: torchvision resnet18; Decoder: light pyramid to 512x512."""
+
     def __init__(self, num_classes=NUM_CLASSES, pretrained=True):
         super().__init__()
         try:
@@ -280,26 +278,26 @@ class ResNet18AE(nn.Module):
         self.l3 = b.layer3
         self.l4 = b.layer4
 
-        self.dec4 = UpBlock(512, 256)
-        self.dec3 = UpBlock(256, 128)
-        self.dec2 = UpBlock(128, 64)
-        self.dec1 = UpBlock(64, 32)
-        self.dec0 = UpBlock(32, 16)
+        self.dec4 = UpBlock(512, 256)  # 1/32 -> 1/16
+        self.dec3 = UpBlock(256, 128)  # 1/16 -> 1/8
+        self.dec2 = UpBlock(128, 64)  # 1/8  -> 1/4
+        self.dec1 = UpBlock(64, 32)  # 1/4  -> 1/2
+        self.dec0 = UpBlock(32, 16)  # 1/2  -> 1
         self.out = nn.Conv2d(16, 3, 1)
 
         self.ad3 = nn.Conv2d(256, 256, 1)
         self.ad2 = nn.Conv2d(128, 128, 1)
         self.ad1 = nn.Conv2d(64, 64, 1)
 
-        # Класифікатор використовує повні 512 каналів
+        # DISENTANGLEMENT: Класифікатор читає тільки 448 каналів
         self.cls_head = nn.Sequential(
             nn.AdaptiveAvgPool2d((1, 1)),
             nn.Flatten(),
-            nn.Linear(512, num_classes)
+            nn.Linear(448, num_classes)
         )
 
-        # Регресор ФР підключається до шару декодера (d2 має 128 каналів)
-        self.fd_head = FDRegressor(in_channels=128)
+        # DISENTANGLEMENT: Регресор ФР читає тільки 64 канали
+        self.fd_head = FDRegressor(in_channels=64)
 
     def encode(self, x):
         x = self.enc_relu(self.enc_bn1(self.enc_conv1(x)))
@@ -307,10 +305,11 @@ class ResNet18AE(nn.Module):
         o1 = self.l1(x)
         o2 = self.l2(o1)
         o3 = self.l3(o2)
-        z = self.l4(o3)
+        z = self.l4(o3)  # Вектор на 512 каналів
         return z, (o1.detach(), o2.detach(), o3.detach())
 
     def decode(self, z):
+        # Декодер використовує всі 512 каналів для ідеальної реконструкції
         d3 = self.dec4(z)
         d2 = self.dec3(d3)
         d1 = self.dec2(d2)
@@ -318,14 +317,17 @@ class ResNet18AE(nn.Module):
         u = self.dec1(d1)
         u = self.dec0(u)
         xrec = torch.sigmoid(self.out(u))
-        # Повертаємо проміжний шар декодера d2 для прогнозування ФР
-        return xrec, (dout1, dout2, dout3), d2
+        return xrec, (dout1, dout2, dout3)
 
     def classify_from_latent(self, z):
-        return self.cls_head(z)
+        # Фізичне розщеплення: беремо лише канали з індексами від 0 до 447
+        z_cls = z[:, :448]
+        return self.cls_head(z_cls)
 
-    def predict_fd_from_decoder(self, d_features):
-        return self.fd_head(d_features)
+    def predict_fd_from_latent(self, z):
+        # Фізичне розщеплення: беремо лише канали з індексами від 448 до 511
+        z_fd = z[:, 448:]
+        return self.fd_head(z_fd)
 
 
 # =======================
@@ -369,16 +371,17 @@ class LitFractalAE(LightningModule):
         x_all = torch.cat([x_l, x_u], dim=0)
         fd_t_all = torch.cat([fd_l, fd_u], dim=0)
 
+        # 1. Енкодер видає спільний вектор z_all
         z_all, (o1, o2, o3) = self.net.encode(x_all)
-        # Отримуємо проміжний шар декодера d_features
-        xrec_all, (d1, d2, d3), d_features = self.net.decode(z_all)
+        xrec_all, (d1, d2, d3) = self.net.decode(z_all)
 
         loss_rec = self.reconstruction_loss(xrec_all, x_all, o1, d1, o2, d2, o3, d3)
 
-        # Регресор читає ознаки з декодера, а не з енкодера
-        fd_p_all = self.net.predict_fd_from_decoder(d_features)
+        # 2. ФР-регресор читає свою половину (через метод predict_fd)
+        fd_p_all = self.net.predict_fd_from_latent(z_all)
         loss_fd = self.mse(fd_p_all, fd_t_all)
 
+        # 3. Класифікатор читає свою половину (через метод classify_from_latent)
         B_l = x_l.size(0)
         logits_l = self.net.classify_from_latent(z_all[:B_l])
         loss_ce = self.ce(logits_l, y_l)
@@ -396,11 +399,11 @@ class LitFractalAE(LightningModule):
         x, y, fd_t = batch
 
         z, (o1, o2, o3) = self.net.encode(x)
-        xrec, (d1, d2, d3), d_features = self.net.decode(z)
+        xrec, (d1, d2, d3) = self.net.decode(z)
 
         loss_rec = self.reconstruction_loss(xrec, x, o1, d1, o2, d2, o3, d3)
 
-        fd_p = self.net.predict_fd_from_decoder(d_features)
+        fd_p = self.net.predict_fd_from_latent(z)
         loss_fd = self.mse(fd_p, fd_t)
 
         logits = self.net.classify_from_latent(z)
@@ -453,14 +456,13 @@ class LitFractalAE(LightningModule):
 
         print("\n=== TEST CLASSIFICATION REPORT ===\n", final_report)
 
+        # Save report text using METRICS_DIR
         with open(os.path.join(METRICS_DIR, f"test_report_{self.hparams.model_name}.txt"), "w",
                   encoding="utf-8") as f:
             f.write(final_report)
 
     def configure_optimizers(self):
-        # Повертаємо стандартний оптимізатор (єдиний LR для всієї мережі)
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
-
         scheduler = ReduceLROnPlateau(
             optimizer,
             mode='max',
@@ -494,17 +496,19 @@ def plot_and_save(history, title, ylabel, path_png):
 # =======================
 # Experiment Runner
 # =======================
-def run_experiment(lambda_fd: float, dm: ChestXRayDataModule):
+def run_experiment(lambda_fd: int, dm: ChestXRayDataModule):
     print(f"\n{'=' * 60}")
     print(f"STARTING EXPERIMENT WITH LAMBDA_FD = {lambda_fd}")
     print(f"{'=' * 60}\n")
 
+    # Generate dynamic model name
     r_str = fmt_pct_three(RC_RATE, "r")
     m_str = fmt_pct_three(LABELED_FRACTION, "m")
-    current_model_name = f"fd_resnetAE_512_l{lambda_fd}_{m_str}_{r_str}_decoder"
+    current_model_name = f"fd_resnetAE_512_l{lambda_fd}_{m_str}_{r_str}"
 
     model = LitFractalAE(rc_rate=RC_RATE, lr=LR, lambda_fd=lambda_fd,
                          ce_weights=getattr(dm, "ce_weights", None))
+    # Pass the name to hparams so the test step can use it to save the text report
     model.hparams.model_name = current_model_name
 
     ckpt = ModelCheckpoint(
@@ -526,11 +530,14 @@ def run_experiment(lambda_fd: float, dm: ChestXRayDataModule):
         deterministic=True,
     )
 
+    # Train and test
     trainer.fit(model, dm)
     trainer.test(model, datamodule=dm, ckpt_path=ckpt.best_model_path if ckpt.best_model_path else "best")
 
+    # Save model weights
     torch.save(model.state_dict(), os.path.join(MODELS_DIR, f"{current_model_name}.pt"))
 
+    # Generate plots
     plot_and_save(model.train_loss_hist, f"Train Loss (L_FD={lambda_fd})", "Loss",
                   os.path.join(PLOTS_DIR, f"{current_model_name}_train_loss.png"))
     plot_and_save(model.val_loss_hist, f"Validation Loss (L_FD={lambda_fd})", "Loss",
@@ -542,6 +549,7 @@ def run_experiment(lambda_fd: float, dm: ChestXRayDataModule):
     print(f" - Best checkpoint: {ckpt.best_model_path if ckpt.best_model_path else '(none)'}")
     print(f" - Latest state_dict: {MODELS_DIR}/{current_model_name}.pt")
 
+    # Cleanup memory for the next loop
     del model
     del trainer
     gc.collect()
@@ -558,14 +566,17 @@ def main():
     print("TRAIN_CSV exists:", os.path.isfile(TRAIN_CSV))
     print("TEST_CSV exists:", os.path.isfile(TEST_CSV))
 
+    # Initialize and prepare DataModule ONLY ONCE
     print("\nPreparing DataModule...")
     dm = ChestXRayDataModule(batch_size=BATCH_SIZE)
     dm.prepare_data()
     dm.setup()
 
-    # Повертаємо ширший діапазон значень для тестування нової архітектури
-    lambda_values = [5.0, 10.0, 20.0]
+    # Запускаємо експерименти з дуже обережними значеннями лямбда
+    # (можна розширити список, якщо ці пройдуть успішно)
+    lambda_values = [0.3, 0.4, 0.6, 0.7]
 
+    # Run them sequentially
     for l_fd in lambda_values:
         run_experiment(l_fd, dm)
 
